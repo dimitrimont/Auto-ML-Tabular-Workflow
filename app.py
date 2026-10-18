@@ -1,131 +1,136 @@
-import streamlit as st
-import pandas as pd
-import joblib
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
-import io
-from src.model_selector2 import run_all_models
-from src.preprocess1 import preprocess_data
+"""
+AutoML for tabular data: pick a CSV and the column to predict, and the app prepares the data,
+tunes nine classifiers by cross-validation, compares them, and keeps the best for predicting new
+rows.
+
+    streamlit run app.py
+"""
+
+import glob
 import os
 
-st.set_page_config(page_title="AutoML Tabular Pipeline", layout="wide")
+import joblib
+import matplotlib.pyplot as plt
+import pandas as pd
+import seaborn as sns
+import streamlit as st
+from sklearn.metrics import classification_report
 
-st.markdown(
-    "<h1 style='color:#e84a5f;'>🧠 AutoML Tabular - ML Pipeline</h1>", unsafe_allow_html=True
-)
+from src.models import FOLDS, MODELS, confusion, predict, roc_curves, run_all_models
+from src.preprocess import Prepared, analyze_columns, load_csv
 
-st.markdown("### Upload your CSV dataset")
-uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
+OUT = "outputs"
+BEST = os.path.join(OUT, "best_model.pkl")
+HERE = os.path.dirname(os.path.abspath(__file__))
 
-if uploaded_file:
-    df = pd.read_csv(uploaded_file)
-    st.write("Dataset Preview:")
+st.set_page_config(page_title="AutoML Tabular", layout="wide")
+st.title("AutoML Tabular")
+st.caption(f"Nine classifiers, each tuned by {FOLDS}-fold cross-validation on the training rows and "
+           "judged once on rows held out from everything.")
+
+# ── 1. data ──────────────────────────────────────────────────────────────────────────────────
+
+st.header("1. Train on your data")
+samples = sorted(glob.glob(os.path.join(HERE, "data", "*.csv")))
+where = st.radio("Data", ["Upload a CSV", "Use a sample from data/"], horizontal=True)
+source = None
+if where == "Upload a CSV":
+    source = st.file_uploader("Choose a CSV file", type="csv")
+else:
+    source = st.selectbox("Sample", samples, format_func=os.path.basename)
+
+if source is not None:
+    if hasattr(source, "seek"):
+        source.seek(0)
+    df, sep, has_header = load_csv(source)
+    keep = st.checkbox("The first row names the columns", value=has_header)
+    if keep != has_header:
+        if hasattr(source, "seek"):
+            source.seek(0)
+        df, sep, has_header = load_csv(source, header=keep)
+    st.caption(f"Read {df.shape[0]:,} rows and {df.shape[1]} columns, separated by {sep!r}, "
+               f"{'with' if has_header else 'without'} a header row.")
     st.dataframe(df.head())
 
-    st.markdown("### Select Target Column")
-    target_col = st.selectbox(
-        "Which column is your prediction target?",
-        df.columns,
-        index=len(df.columns) - 1 if "target" not in df.columns else df.columns.get_loc("target")
-    )
+    target = st.selectbox("Which column should the models predict?", df.columns, index=len(df.columns) - 1)
+    identifiers = analyze_columns(df, target)[2]
+    leave_out = st.multiselect(
+        "Columns to leave out", [c for c in df.columns if c != target], default=identifiers,
+        help="Identifiers, where every value is different, are left out by default: a model can only "
+             "memorise them.")
+    with st.expander("Settings"):
+        trials = st.slider("Optuna trials per model", 5, 50, 20)
+        smote = st.checkbox("Balance the classes with SMOTE (inside each fold)", value=True)
+        chosen = st.multiselect("Models", MODELS, default=MODELS)
 
-    if st.button("Run AutoML Pipeline"):
-        with st.spinner("Processing data and running models... Please wait. 🧑‍💻"):
-            try:
-                # Preprocessing (from preprocess1.py)
-                X_train, X_test, y_train, y_test, preprocessor = preprocess_data(df, target_col)
-                leaderboard = run_all_models(X_train, y_train, X_test, y_test, tune_with_optuna=True, n_trials=20, use_smote=True)
+    if st.button("Run AutoML", type="primary", disabled=not chosen):
+        prepared = Prepared(df, target, leave_out)
+        if prepared.dropped_rows:
+            st.info(f"{prepared.dropped_rows:,} rows have no {target!r} and are left out.")
+        bar = st.progress(0.0)
 
-                # Save the preprocessor for Phase 4 predictions
-                joblib.dump(preprocessor, 'outputs/preprocessor.pkl')
+        def progress(i, name):
+            bar.progress(i / len(chosen), text=f"Tuning {name} ({i + 1} of {len(chosen)})" if name else "Done")
 
-                st.success("AutoML pipeline complete! 🎉")
-                st.markdown("### Model Leaderboard")
-                st.dataframe(leaderboard)
+        try:
+            board, fitted, notes = run_all_models(prepared, chosen, trials, smote, OUT, progress)
+            st.session_state["result"] = {"board": board, "fitted": fitted, "notes": notes, "prepared": prepared}
+        except Exception as e:
+            st.error(f"The run stopped: {e}")
 
-                # Show stats for best model
-                best_model_name = leaderboard.iloc[0]['Model']
-                st.markdown(f"## Best Model: {best_model_name}")
+# ── results ──────────────────────────────────────────────────────────────────────────────────
 
-                # Load the saved best model
-                best_model = joblib.load("outputs/best_model.pkl")
+result = st.session_state.get("result")
+if result:
+    board, prepared = result["board"], result["prepared"]
+    st.subheader("Leaderboard")
+    st.caption(f"Ranked by {FOLDS}-fold cross-validated accuracy on the {len(prepared.y_train):,} training "
+               f"rows. The held-out columns score the {len(prepared.y_test):,} rows no choice was made on.")
+    st.dataframe(board.drop(columns="Settings").style.format(precision=3), hide_index=True)
+    for note in result["notes"]:
+        st.warning(note)
 
-                # Predict on test set for stats and graphs
-                y_pred = best_model.predict(X_test)
-                if hasattr(best_model, "predict_proba"):
-                    y_proba = best_model.predict_proba(X_test)[:, 1]
-                else:
-                    y_proba = None
+    best = board.iloc[0]["Model"]
+    model = result["fitted"][best]
+    labels = [str(c) for c in prepared.classes]
+    st.subheader(f"Best: {best}")
+    st.caption(f"Settings: {board.iloc[0]['Settings']}. Saved with its preprocessing to {BEST}.")
 
-                from sklearn.metrics import confusion_matrix, roc_curve, auc, classification_report
+    left, right = st.columns(2)
+    with left:
+        fig, ax = plt.subplots(figsize=(5, 4))
+        sns.heatmap(confusion(model, prepared), annot=True, fmt="d", cmap="Blues", ax=ax,
+                    xticklabels=labels, yticklabels=labels)
+        ax.set(title="Held-out rows", xlabel="Predicted", ylabel="Actual")
+        st.pyplot(fig)
+    with right:
+        fig, ax = plt.subplots(figsize=(5, 4))
+        for label, fpr, tpr, area in roc_curves(model, prepared):
+            ax.plot(fpr, tpr, label=f"{label} (AUC {area:.2f})")
+        ax.plot([0, 1], [0, 1], "k--", lw=1)
+        ax.set(title="ROC, held-out rows", xlabel="False positive rate", ylabel="True positive rate")
+        ax.legend(fontsize=8)
+        st.pyplot(fig)
 
-                # Confusion Matrix
-                cm = confusion_matrix(y_test, y_pred)
-                fig, ax = plt.subplots()
-                sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax)
-                ax.set_title(f"Confusion Matrix - {best_model_name}")
-                ax.set_xlabel("Predicted label")
-                ax.set_ylabel("True label")
-                st.pyplot(fig)
+    report = classification_report(prepared.y_test, model.predict(prepared.X_test), labels=range(len(labels)),
+                                   target_names=labels, output_dict=True, zero_division=0)
+    st.dataframe(pd.DataFrame(report).transpose().style.format(precision=3))
 
-                # ROC Curve
-                if y_proba is not None:
-                    fpr, tpr, _ = roc_curve(y_test, y_proba)
-                    roc_auc = auc(fpr, tpr)
-                    fig2, ax2 = plt.subplots()
-                    ax2.plot(fpr, tpr, label=f"{best_model_name} (AUC = {roc_auc:.2f})")
-                    ax2.plot([0, 1], [0, 1], "k--", label="Random")
-                    ax2.set_xlabel("False Positive Rate")
-                    ax2.set_ylabel("True Positive Rate")
-                    ax2.set_title(f"ROC Curve - {best_model_name}")
-                    ax2.legend()
-                    st.pyplot(fig2)
+# ── 2. predict ───────────────────────────────────────────────────────────────────────────────
 
-                # Classification report
-                report = classification_report(y_test, y_pred, output_dict=True)
-                st.markdown("#### Classification Report")
-                st.dataframe(pd.DataFrame(report).transpose())
-
-            except Exception as e:
-                st.error(f"An error occurred during AutoML processing: {e}")
-                st.stop()
-st.markdown("")
-st.markdown("")
-st.markdown("---")
-st.markdown("## Predict on New Data")
-st.markdown("#### To run this you must first upload a CSV file and run the AutoML pipeline!")
-pred_file = st.file_uploader("Upload a new CSV for prediction", key="predict_csv", type="csv")
-
-preproc_exists = os.path.exists('outputs/preprocessor.pkl')
-model_exists = os.path.exists('outputs/best_model.pkl')
-
-if pred_file:
-    if not (preproc_exists and model_exists):
-        st.warning("⚠️ Please complete Step 1 first! You must train a model on your own data before you can use the prediction feature.")
+st.header("2. Predict new rows")
+new = st.file_uploader("A CSV with the same columns (the target column may be left out)", type="csv", key="new")
+if not os.path.exists(BEST):
+    st.info("Train a model in step 1 first; the best one is kept for predictions.")
+elif new is not None:
+    bundle = joblib.load(BEST)  # written by step 1 on this machine; never load someone else's .pkl
+    rows, _, _ = load_csv(new)
+    try:
+        rows[f"Predicted {bundle['target']}"] = predict(bundle, rows)
+    except ValueError as e:
+        st.error(str(e))
     else:
-        new_data = pd.read_csv(pred_file)
-        st.write("New Data Preview:", new_data.head())
-
-        # Load saved preprocessor and model
-        preprocessor = joblib.load('outputs/preprocessor.pkl')
-        model = joblib.load('outputs/best_model.pkl')
-
-        # Preprocess and predict
-        X_new = preprocessor.transform(new_data)
-        preds = model.predict(X_new)
-
-        # Show and offer download
-        new_data['Prediction'] = preds
-        st.markdown("### Predictions")
-        st.dataframe(new_data)
-
-        # Download link
-        csv_out = new_data.to_csv(index=False).encode('utf-8')
-        st.download_button("Download Predictions as CSV", data=csv_out, file_name="predictions.csv", mime="text/csv")
-else:
-    if not (preproc_exists and model_exists):
-        st.info("ℹ️ To use Phase 4 (predict on new data), please upload and train a model in Step 1 first.")
-
-st.markdown("---")
-st.markdown("Built with 🧠 by Dimitri. Powered by Streamlit + scikit-learn + Optuna + more.")
+        st.caption(f"{len(rows):,} rows predicted by {bundle['model']}.")
+        st.dataframe(rows)
+        st.download_button("Download predictions as CSV", rows.to_csv(index=False).encode("utf-8"),
+                           file_name="predictions.csv", mime="text/csv")

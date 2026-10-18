@@ -1,0 +1,6 @@
+outputs/
+__pycache__/
+.pytest_cache/
+.venv/
+catboost_info/
+.DS_Store
